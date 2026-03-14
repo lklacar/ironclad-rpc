@@ -17,6 +17,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -157,6 +158,80 @@ class RcpRuntimeTest {
     }
 
     @Test
+    void retriesUnaryRequestsWithFreshMessagesAndCompletesOnALaterAttempt() {
+        runtime = new RcpRuntime<>(TestConnection::id, Duration.ofMillis(50));
+        runtime.onOpen(connection);
+
+        var requestCount = new AtomicInteger();
+        var responseStage = runtime.sendWithRetry(
+                        connection,
+                        () -> new PingRequest("ping-" + requestCount.incrementAndGet()),
+                        RcpRetryPolicy.timeoutOnly(3)
+                )
+                .subscribe()
+                .asCompletionStage();
+
+        var firstAttempt = connection.awaitMessage(0, PingRequest.class);
+        var secondAttempt = connection.awaitMessage(1, PingRequest.class);
+
+        var response = new PongResponse("pong");
+        response.setId(UUID.randomUUID());
+        response.setCorrelationId(secondAttempt.getId());
+        runtime.onMessage(connection.id(), response);
+
+        assertSame(response, responseStage.toCompletableFuture().join());
+        assertEquals(2, requestCount.get());
+        assertEquals("ping-1", firstAttempt.payload());
+        assertEquals("ping-2", secondAttempt.payload());
+        assertTrue(!firstAttempt.getId().equals(secondAttempt.getId()));
+    }
+
+    @Test
+    void doesNotRetryUnaryRequestsForRemoteFailuresThatDoNotMatchThePolicy() {
+        var requestCount = new AtomicInteger();
+        var responseStage = runtime.sendWithRetry(
+                        connection,
+                        () -> new PingRequest("ping-" + requestCount.incrementAndGet()),
+                        RcpRetryPolicy.timeoutOnly(3)
+                )
+                .subscribe()
+                .asCompletionStage();
+
+        var outboundRequest = connection.singleMessage(PingRequest.class);
+
+        var errorResponse = new RcpErrorResponse("remote.failure", "boom");
+        errorResponse.setId(UUID.randomUUID());
+        errorResponse.setCorrelationId(outboundRequest.getId());
+        runtime.onMessage(connection.id(), errorResponse);
+
+        var exception = assertThrows(CompletionException.class, () -> responseStage.toCompletableFuture().join());
+        assertInstanceOf(RcpRemoteException.class, exception.getCause());
+        assertEquals(1, requestCount.get());
+        assertEquals(1, connection.sentMessages().size());
+    }
+
+    @Test
+    void rejectsRetryFactoriesThatReuseTheSameRequestInstance() {
+        runtime = new RcpRuntime<>(TestConnection::id, Duration.ofMillis(50));
+        runtime.onOpen(connection);
+
+        var reusedRequest = new PingRequest("ping");
+        var responseStage = runtime.sendWithRetry(
+                        connection,
+                        () -> reusedRequest,
+                        RcpRetryPolicy.timeoutOnly(2)
+                )
+                .subscribe()
+                .asCompletionStage();
+
+        connection.awaitMessage(0, PingRequest.class);
+
+        var exception = assertThrows(CompletionException.class, () -> responseStage.toCompletableFuture().join());
+        assertInstanceOf(IllegalStateException.class, exception.getCause());
+        assertEquals("requestFactory must return a fresh request instance per retry attempt", exception.getCause().getMessage());
+    }
+
+    @Test
     void turnsRemoteErrorResponsesIntoFailedStreams() {
         var probe = StreamProbe.capture(runtime.send(connection, new ChunkRequest("chunk")));
         var outboundRequest = connection.singleMessage(ChunkRequest.class);
@@ -274,6 +349,24 @@ class RcpRuntimeTest {
 
         private <T extends RcpMessage> T message(int index, Class<T> type) {
             return assertInstanceOf(type, sentMessages.get(index));
+        }
+
+        private <T extends RcpMessage> T awaitMessage(int index, Class<T> type) {
+            var deadline = System.nanoTime() + Duration.ofSeconds(1).toNanos();
+            while (System.nanoTime() < deadline) {
+                if (sentMessages.size() > index) {
+                    return assertInstanceOf(type, sentMessages.get(index));
+                }
+
+                try {
+                    Thread.sleep(5);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("Interrupted while waiting for message", e);
+                }
+            }
+
+            throw new AssertionError("Timed out waiting for outbound message " + index);
         }
     }
 
