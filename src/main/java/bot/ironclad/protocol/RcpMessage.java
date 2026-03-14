@@ -1,4 +1,4 @@
-package bot.ironclad;
+package bot.ironclad.protocol;
 
 import java.util.UUID;
 

@@ -1,4 +1,7 @@
-package bot.ironclad;
+package bot.ironclad.runtime;
+
+import bot.ironclad.protocol.RcpErrorResponse;
+import bot.ironclad.protocol.RcpMessage;
 
 import java.util.Objects;
 import java.util.UUID;

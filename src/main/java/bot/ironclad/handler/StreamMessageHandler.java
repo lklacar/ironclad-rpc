@@ -1,5 +1,7 @@
-package bot.ironclad;
+package bot.ironclad.handler;
 
+import bot.ironclad.protocol.RcpMessage;
+import bot.ironclad.protocol.RcpStreamRequest;
 import io.smallrye.mutiny.Multi;
 
 @FunctionalInterface

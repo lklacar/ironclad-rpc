@@ -1,4 +1,6 @@
-package bot.ironclad;
+package bot.ironclad.runtime;
+
+import bot.ironclad.protocol.RcpErrorResponse;
 
 public final class RcpRemoteException extends RuntimeException {
     private final String errorType;
