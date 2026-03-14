@@ -3,13 +3,13 @@ package bot.ironclad;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class RcpMessageHandlerRegistry {
-    private final ConcurrentHashMap<Class<RcpMessage>, MessageHandler<RcpMessage, RcpMessage>> handlers;
+    private final ConcurrentHashMap<Class<? extends RcpMessage>, MessageHandler<RcpMessage, RcpMessage>> handlers;
 
     public RcpMessageHandlerRegistry() {
         handlers = new ConcurrentHashMap<>();
     }
 
-    public void register(Class<RcpMessage> messageType, MessageHandler<RcpMessage, RcpMessage> handler) {
+    public void register(Class<? extends RcpMessage> messageType, MessageHandler<RcpMessage, RcpMessage> handler) {
         handlers.put(messageType, handler);
     }
 

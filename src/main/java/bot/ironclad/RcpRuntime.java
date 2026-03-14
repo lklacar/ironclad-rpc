@@ -9,7 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class RcpRuntime {
 
     private final RcpMessageHandlerRegistry handlerRegistry = new RcpMessageHandlerRegistry();
-    private final ConcurrentHashMap<UUID, UniResponser<? super RcpMessage>> pendingUniResponses = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, UniResponser> pendingUniResponses = new ConcurrentHashMap<>();
 
     public void onMessage(RcpMessage message) {
         var handler = handlerRegistry.getHandler(message.getClass());
@@ -25,11 +25,11 @@ public class RcpRuntime {
         }
     }
 
-    public <TRes extends RcpMessage> Uni<TRes> sendMessageAndGetResponse(RcpMessage request) {
+    public Uni<RcpMessage> sendMessageAndGetResponse(RcpMessage request) {
         return Uni.createFrom().emitter(emitter -> {
             var id = UUID.randomUUID();
             request.setId(id);
-            var uniResponder = new UniResponser<>(emitter);
+            var uniResponder = new UniResponser(emitter);
             pendingUniResponses.put(id, uniResponder);
         });
     }
