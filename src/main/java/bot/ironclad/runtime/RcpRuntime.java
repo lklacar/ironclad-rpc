@@ -229,10 +229,10 @@ public class RcpRuntime<T extends RcpConnection> {
             throw new IllegalStateException("No connection for senderId " + senderId);
         }
 
-        var response = safelyHandle(connection, senderId, request);
-        ensureMessageId(response);
-        response.setCorrelationId(request.getId());
-        connection.send(response);
+        safelyHandle(connection, senderId, request).subscribe().with(
+                item -> sendCorrelatedMessage(connection, request.getId(), item),
+                failure -> sendCorrelatedMessage(connection, request.getId(), RcpErrorResponse.from(failure))
+        );
     }
 
     private void handleIncomingStreamRequest(UUID senderId, RcpStreamRequest<?> request) {
@@ -254,7 +254,7 @@ public class RcpRuntime<T extends RcpConnection> {
         );
     }
 
-    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> RcpMessage safelyHandle(
+    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<? extends RcpMessage> safelyHandle(
             T connection,
             UUID connectionId,
             TReq request
@@ -262,7 +262,7 @@ public class RcpRuntime<T extends RcpConnection> {
         try {
             return invokeServerUnaryInterceptors(connection, connectionId, request, 0);
         } catch (Throwable throwable) {
-            return RcpErrorResponse.from(throwable);
+            return Uni.createFrom().failure(throwable);
         }
     }
 
@@ -363,7 +363,7 @@ public class RcpRuntime<T extends RcpConnection> {
         );
     }
 
-    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> TRes invokeServerUnaryInterceptors(
+    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> invokeServerUnaryInterceptors(
             T connection,
             UUID connectionId,
             TReq request,
@@ -373,12 +373,12 @@ public class RcpRuntime<T extends RcpConnection> {
             return handlerRegistry.handle(request);
         }
 
-        return serverInterceptors.get(interceptorIndex).interceptUnary(
+        return Objects.requireNonNull(serverInterceptors.get(interceptorIndex).interceptUnary(
                 connection,
                 connectionId,
                 request,
                 nextRequest -> invokeServerUnaryInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
-        );
+        ), "server interceptor returned null");
     }
 
     private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> invokeServerStreamInterceptors(

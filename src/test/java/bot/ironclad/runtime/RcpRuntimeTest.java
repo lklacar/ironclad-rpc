@@ -9,6 +9,7 @@ import bot.ironclad.protocol.RcpRequest;
 import bot.ironclad.protocol.RcpStreamCompleted;
 import bot.ironclad.protocol.RcpStreamRequest;
 import io.smallrye.mutiny.Multi;
+import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -42,17 +43,38 @@ class RcpRuntimeTest {
 
     @Test
     void dispatchesIncomingRequestsToTheirTypedHandler() {
-        runtime.registerHandler(PingRequest.class, request -> new PongResponse("pong:" + request.payload()));
+        runtime.registerHandler(PingRequest.class, request -> Uni.createFrom().item(new PongResponse("pong:" + request.payload())));
 
         var request = new PingRequest("ping");
         request.setId(UUID.randomUUID());
 
         runtime.onMessage(connection.id(), request);
 
-        var response = connection.singleMessage(PongResponse.class);
+        var response = connection.awaitMessage(0, PongResponse.class);
         assertNotNull(response.getId());
         assertEquals(request.getId(), response.getCorrelationId());
         assertEquals("pong:ping", response.payload());
+    }
+
+    @Test
+    void dispatchesIncomingRequestsWhenUnaryHandlerCompletesLater() {
+        runtime.registerHandler(
+                PingRequest.class,
+                request -> Uni.createFrom()
+                        .item(new PongResponse("later:" + request.payload()))
+                        .onItem()
+                        .delayIt()
+                        .by(Duration.ofMillis(20))
+        );
+
+        var request = new PingRequest("ping");
+        request.setId(UUID.randomUUID());
+
+        runtime.onMessage(connection.id(), request);
+
+        var response = connection.awaitMessage(0, PongResponse.class);
+        assertEquals("later:ping", response.payload());
+        assertEquals(request.getId(), response.getCorrelationId());
     }
 
     @Test
@@ -322,16 +344,14 @@ class RcpRuntimeTest {
 
     @Test
     void sendsErrorResponsesWhenHandlersFail() {
-        runtime.registerHandler(PingRequest.class, request -> {
-            throw new IllegalStateException("boom");
-        });
+        runtime.registerHandler(PingRequest.class, request -> Uni.createFrom().failure(new IllegalStateException("boom")));
 
         var request = new PingRequest("ping");
         request.setId(UUID.randomUUID());
 
         runtime.onMessage(connection.id(), request);
 
-        var errorResponse = connection.singleMessage(RcpErrorResponse.class);
+        var errorResponse = connection.awaitMessage(0, RcpErrorResponse.class);
         assertNotNull(errorResponse.getId());
         assertEquals(request.getId(), errorResponse.getCorrelationId());
         assertEquals(IllegalStateException.class.getName(), errorResponse.getErrorType());
@@ -343,24 +363,25 @@ class RcpRuntimeTest {
         runtime.addServerInterceptor(new RcpServerInterceptor<>() {
             @Override
             @SuppressWarnings("unchecked")
-            public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> TRes interceptUnary(
+            public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> interceptUnary(
                     TestConnection interceptedConnection,
                     UUID connectionId,
                     TReq request,
-                    Function<TReq, TRes> next
+                    Function<TReq, Uni<TRes>> next
             ) {
-                var response = next.apply((TReq) new PingRequest("server:" + ((PingRequest) request).payload()));
-                return (TRes) new PongResponse(((PongResponse) response).payload() + ":server");
+                return next.apply((TReq) new PingRequest("server:" + ((PingRequest) request).payload()))
+                        .onItem()
+                        .transform(response -> (TRes) new PongResponse(((PongResponse) response).payload() + ":server"));
             }
         });
-        runtime.registerHandler(PingRequest.class, request -> new PongResponse(request.payload()));
+        runtime.registerHandler(PingRequest.class, request -> Uni.createFrom().item(new PongResponse(request.payload())));
 
         var request = new PingRequest("ping");
         request.setId(UUID.randomUUID());
 
         runtime.onMessage(connection.id(), request);
 
-        var response = connection.singleMessage(PongResponse.class);
+        var response = connection.awaitMessage(0, PongResponse.class);
         assertEquals("server:ping:server", response.payload());
     }
 

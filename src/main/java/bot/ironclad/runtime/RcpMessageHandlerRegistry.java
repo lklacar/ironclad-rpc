@@ -6,6 +6,7 @@ import bot.ironclad.protocol.RcpMessage;
 import bot.ironclad.protocol.RcpRequest;
 import bot.ironclad.protocol.RcpStreamRequest;
 import io.smallrye.mutiny.Multi;
+import io.smallrye.mutiny.Uni;
 
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -29,7 +30,7 @@ public class RcpMessageHandlerRegistry {
         );
     }
 
-    public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> TRes handle(TReq request) {
+    public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> handle(TReq request) {
         return getHandler(request).handle(request);
     }
 
@@ -80,7 +81,7 @@ public class RcpMessageHandlerRegistry {
             this.handler = Objects.requireNonNull(handler, "handler");
         }
 
-        private TRes handle(RcpRequest<?> request) {
+        private Uni<TRes> handle(RcpRequest<?> request) {
             return Objects.requireNonNull(
                     handler.handle(messageType.cast(request)),
                     () -> "Handler returned null for " + messageType.getName()

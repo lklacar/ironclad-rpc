@@ -5,16 +5,17 @@ import bot.ironclad.protocol.RcpMessage;
 import bot.ironclad.protocol.RcpRequest;
 import bot.ironclad.protocol.RcpStreamRequest;
 import io.smallrye.mutiny.Multi;
+import io.smallrye.mutiny.Uni;
 
 import java.util.UUID;
 import java.util.function.Function;
 
 public interface RcpServerInterceptor<T extends RcpConnection> {
-    default <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> TRes interceptUnary(
+    default <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> interceptUnary(
             T connection,
             UUID connectionId,
             TReq request,
-            Function<TReq, TRes> next
+            Function<TReq, Uni<TRes>> next
     ) {
         return next.apply(request);
     }
