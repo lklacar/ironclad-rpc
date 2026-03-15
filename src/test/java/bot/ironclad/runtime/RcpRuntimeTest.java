@@ -1,8 +1,8 @@
 package bot.ironclad.runtime;
 
 import bot.ironclad.connection.RcpConnection;
-import bot.ironclad.interceptor.RcpClientInterceptor;
-import bot.ironclad.interceptor.RcpServerInterceptor;
+import bot.ironclad.interceptor.RcpInboundInterceptor;
+import bot.ironclad.interceptor.RcpOutboundInterceptor;
 import bot.ironclad.protocol.RcpErrorResponse;
 import bot.ironclad.protocol.RcpMessage;
 import bot.ironclad.protocol.RcpRequest;
@@ -20,6 +20,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
@@ -37,7 +38,9 @@ class RcpRuntimeTest {
     @BeforeEach
     void setUp() {
         connection = new TestConnection(UUID.randomUUID());
-        runtime = new RcpRuntime<>(TestConnection::id, Duration.ofSeconds(1));
+        runtime = RcpRuntime.<TestConnection>builder(TestConnection::id)
+                .responseTimeout(Duration.ofSeconds(1))
+                .build();
         runtime.onOpen(connection);
     }
 
@@ -126,10 +129,10 @@ class RcpRuntimeTest {
     }
 
     @Test
-    void clientInterceptorsWrapUnaryCallsInRegistrationOrder() {
+    void outboundInterceptorsWrapUnaryCallsInRegistrationOrder() {
         var events = new ArrayList<String>();
-        runtime.addClientInterceptor(new RecordingClientInterceptor(events, "first"));
-        runtime.addClientInterceptor(new RecordingClientInterceptor(events, "second"));
+        runtime.addOutboundInterceptor(new RecordingOutboundInterceptor(events, "first"));
+        runtime.addOutboundInterceptor(new RecordingOutboundInterceptor(events, "second"));
 
         var responseStage = runtime.send(connection, new PingRequest("ping")).subscribe().asCompletionStage();
         var outboundRequest = connection.singleMessage(PingRequest.class);
@@ -178,8 +181,8 @@ class RcpRuntimeTest {
     }
 
     @Test
-    void clientInterceptorsWrapStreamCalls() {
-        runtime.addClientInterceptor(new RcpClientInterceptor<>() {
+    void outboundInterceptorsWrapStreamCalls() {
+        runtime.addOutboundInterceptor(new RcpOutboundInterceptor<>() {
             @Override
             @SuppressWarnings("unchecked")
             public <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> interceptStream(
@@ -247,7 +250,9 @@ class RcpRuntimeTest {
 
     @Test
     void retriesUnaryRequestsWithFreshMessagesAndCompletesOnALaterAttempt() {
-        runtime = new RcpRuntime<>(TestConnection::id, Duration.ofMillis(50));
+        runtime = RcpRuntime.<TestConnection>builder(TestConnection::id)
+                .responseTimeout(Duration.ofMillis(50))
+                .build();
         runtime.onOpen(connection);
 
         var requestCount = new AtomicInteger();
@@ -300,7 +305,9 @@ class RcpRuntimeTest {
 
     @Test
     void rejectsRetryFactoriesThatReuseTheSameRequestInstance() {
-        runtime = new RcpRuntime<>(TestConnection::id, Duration.ofMillis(50));
+        runtime = RcpRuntime.<TestConnection>builder(TestConnection::id)
+                .responseTimeout(Duration.ofMillis(50))
+                .build();
         runtime.onOpen(connection);
 
         var reusedRequest = new PingRequest("ping");
@@ -359,8 +366,8 @@ class RcpRuntimeTest {
     }
 
     @Test
-    void serverInterceptorsWrapUnaryHandlers() {
-        runtime.addServerInterceptor(new RcpServerInterceptor<>() {
+    void inboundInterceptorsWrapUnaryHandlers() {
+        runtime.addInboundInterceptor(new RcpInboundInterceptor<>() {
             @Override
             @SuppressWarnings("unchecked")
             public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> interceptUnary(
@@ -386,8 +393,8 @@ class RcpRuntimeTest {
     }
 
     @Test
-    void serverInterceptorsWrapStreamHandlers() {
-        runtime.addServerInterceptor(new RcpServerInterceptor<>() {
+    void inboundInterceptorsWrapStreamHandlers() {
+        runtime.addInboundInterceptor(new RcpInboundInterceptor<>() {
             @Override
             @SuppressWarnings("unchecked")
             public <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> interceptStream(
@@ -464,6 +471,52 @@ class RcpRuntimeTest {
                 "Connection %s closed while waiting for a response".formatted(connection.id()),
                 exception.getMessage()
         );
+    }
+
+    @Test
+    void builderAppliesConfiguredOutboundInterceptorsAndTimeout() {
+        runtime = RcpRuntime.<TestConnection>builder(TestConnection::id)
+                .responseTimeout(Duration.ofMillis(50))
+                .outboundInterceptor(new RecordingOutboundInterceptor(new ArrayList<>(), "builder"))
+                .build();
+        runtime.onOpen(connection);
+
+        var responseStage = runtime.send(connection, new PingRequest("ping")).subscribe().asCompletionStage();
+        var outboundRequest = connection.awaitMessage(0, PingRequest.class);
+
+        assertEquals("ping|builder", outboundRequest.payload());
+
+        var exception = assertThrows(CompletionException.class, () -> responseStage.toCompletableFuture().join());
+        assertInstanceOf(TimeoutException.class, exception.getCause());
+    }
+
+    @Test
+    void builderAppliesConfiguredInboundInterceptors() {
+        runtime = RcpRuntime.<TestConnection>builder(TestConnection::id)
+                .inboundInterceptor(new RcpInboundInterceptor<>() {
+                    @Override
+                    @SuppressWarnings("unchecked")
+                    public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> interceptUnary(
+                            TestConnection interceptedConnection,
+                            UUID connectionId,
+                            TReq request,
+                            Function<TReq, Uni<TRes>> next
+                    ) {
+                        return next.apply((TReq) new PingRequest("builder:" + ((PingRequest) request).payload()));
+                    }
+                })
+                .build();
+        runtime.onOpen(connection);
+
+        runtime.registerHandler(PingRequest.class, request -> Uni.createFrom().item(new PongResponse(request.payload())));
+
+        var request = new PingRequest("ping");
+        request.setId(UUID.randomUUID());
+
+        runtime.onMessage(connection.id(), request);
+
+        var response = connection.awaitMessage(0, PongResponse.class);
+        assertEquals("builder:ping", response.payload());
     }
 
     private static final class TestConnection implements RcpConnection {
@@ -605,11 +658,11 @@ class RcpRuntimeTest {
         }
     }
 
-    private static final class RecordingClientInterceptor implements RcpClientInterceptor<TestConnection> {
+    private static final class RecordingOutboundInterceptor implements RcpOutboundInterceptor<TestConnection> {
         private final List<String> events;
         private final String name;
 
-        private RecordingClientInterceptor(List<String> events, String name) {
+        private RecordingOutboundInterceptor(List<String> events, String name) {
             this.events = events;
             this.name = name;
         }

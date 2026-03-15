@@ -10,7 +10,7 @@ import io.smallrye.mutiny.Uni;
 import java.util.UUID;
 import java.util.function.Function;
 
-public interface RcpServerInterceptor<T extends RcpConnection> {
+public interface RcpInboundInterceptor<T extends RcpConnection> {
     default <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> interceptUnary(
             T connection,
             UUID connectionId,

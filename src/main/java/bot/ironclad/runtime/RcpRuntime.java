@@ -3,8 +3,8 @@ package bot.ironclad.runtime;
 import bot.ironclad.connection.RcpConnection;
 import bot.ironclad.handler.MessageHandler;
 import bot.ironclad.handler.StreamMessageHandler;
-import bot.ironclad.interceptor.RcpClientInterceptor;
-import bot.ironclad.interceptor.RcpServerInterceptor;
+import bot.ironclad.interceptor.RcpInboundInterceptor;
+import bot.ironclad.interceptor.RcpOutboundInterceptor;
 import bot.ironclad.protocol.RcpErrorResponse;
 import bot.ironclad.protocol.RcpMessage;
 import bot.ironclad.protocol.RcpRequest;
@@ -16,6 +16,7 @@ import io.smallrye.mutiny.subscription.Cancellable;
 import io.smallrye.mutiny.subscription.UniEmitter;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Objects;
@@ -33,18 +34,28 @@ public class RcpRuntime<T extends RcpConnection> {
     private final RcpMessageHandlerRegistry handlerRegistry = new RcpMessageHandlerRegistry();
     private final ConcurrentHashMap<UUID, PendingResponse<?>> pendingResponses = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, T> connections = new ConcurrentHashMap<>();
-    private final CopyOnWriteArrayList<RcpClientInterceptor<T>> clientInterceptors = new CopyOnWriteArrayList<>();
-    private final CopyOnWriteArrayList<RcpServerInterceptor<T>> serverInterceptors = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<RcpOutboundInterceptor<T>> outboundInterceptors = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<RcpInboundInterceptor<T>> inboundInterceptors = new CopyOnWriteArrayList<>();
     private final Function<T, UUID> connectionIdProvider;
     private final Duration responseTimeout;
 
+    public static <T extends RcpConnection> Builder<T> builder(Function<T, UUID> connectionIdProvider) {
+        return new Builder<>(connectionIdProvider);
+    }
+
     public RcpRuntime(Function<T, UUID> connectionIdProvider) {
-        this(connectionIdProvider, DEFAULT_RESPONSE_TIMEOUT);
+        this(new Builder<>(connectionIdProvider));
     }
 
     public RcpRuntime(Function<T, UUID> connectionIdProvider, Duration responseTimeout) {
-        this.connectionIdProvider = Objects.requireNonNull(connectionIdProvider, "connectionIdProvider");
-        this.responseTimeout = Objects.requireNonNull(responseTimeout, "responseTimeout");
+        this(new Builder<>(connectionIdProvider).responseTimeout(responseTimeout));
+    }
+
+    private RcpRuntime(Builder<T> builder) {
+        this.connectionIdProvider = Objects.requireNonNull(builder.connectionIdProvider, "connectionIdProvider");
+        this.responseTimeout = requireResponseTimeout(builder.responseTimeout);
+        this.outboundInterceptors.addAll(builder.outboundInterceptors);
+        this.inboundInterceptors.addAll(builder.inboundInterceptors);
     }
 
     public void onOpen(T connection) {
@@ -100,7 +111,7 @@ public class RcpRuntime<T extends RcpConnection> {
         }
 
         try {
-            return invokeClientUnaryInterceptors(connection, connectionId, request, 0);
+            return invokeOutboundUnaryInterceptors(connection, connectionId, request, 0);
         } catch (Throwable throwable) {
             return Uni.createFrom().failure(throwable);
         }
@@ -120,7 +131,7 @@ public class RcpRuntime<T extends RcpConnection> {
         }
 
         try {
-            return invokeClientStreamInterceptors(connection, connectionId, request, 0);
+            return invokeOutboundStreamInterceptors(connection, connectionId, request, 0);
         } catch (Throwable throwable) {
             return Multi.createFrom().failure(throwable);
         }
@@ -200,12 +211,12 @@ public class RcpRuntime<T extends RcpConnection> {
         handlerRegistry.registerStreamHandler(requestType, handler);
     }
 
-    public void addClientInterceptor(RcpClientInterceptor<T> interceptor) {
-        clientInterceptors.add(Objects.requireNonNull(interceptor, "interceptor"));
+    public void addOutboundInterceptor(RcpOutboundInterceptor<T> interceptor) {
+        outboundInterceptors.add(Objects.requireNonNull(interceptor, "interceptor"));
     }
 
-    public void addServerInterceptor(RcpServerInterceptor<T> interceptor) {
-        serverInterceptors.add(Objects.requireNonNull(interceptor, "interceptor"));
+    public void addInboundInterceptor(RcpInboundInterceptor<T> interceptor) {
+        inboundInterceptors.add(Objects.requireNonNull(interceptor, "interceptor"));
     }
 
     private UUID resolveConnectionId(T connection) {
@@ -229,7 +240,7 @@ public class RcpRuntime<T extends RcpConnection> {
             throw new IllegalStateException("No connection for senderId " + senderId);
         }
 
-        safelyHandle(connection, senderId, request).subscribe().with(
+        safelyHandleInboundUnary(connection, senderId, request).subscribe().with(
                 item -> sendCorrelatedMessage(connection, request.getId(), item),
                 failure -> sendCorrelatedMessage(connection, request.getId(), RcpErrorResponse.from(failure))
         );
@@ -247,32 +258,32 @@ public class RcpRuntime<T extends RcpConnection> {
             throw new IllegalStateException("No connection for senderId " + senderId);
         }
 
-        safelyHandle(connection, senderId, request).subscribe().with(
+        safelyHandleInboundStream(connection, senderId, request).subscribe().with(
                 item -> sendCorrelatedMessage(connection, request.getId(), item),
                 failure -> sendCorrelatedMessage(connection, request.getId(), RcpErrorResponse.from(failure)),
                 () -> sendCorrelatedMessage(connection, request.getId(), new RcpStreamCompleted())
         );
     }
 
-    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<? extends RcpMessage> safelyHandle(
+    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<? extends RcpMessage> safelyHandleInboundUnary(
             T connection,
             UUID connectionId,
             TReq request
     ) {
         try {
-            return invokeServerUnaryInterceptors(connection, connectionId, request, 0);
+            return invokeInboundUnaryInterceptors(connection, connectionId, request, 0);
         } catch (Throwable throwable) {
             return Uni.createFrom().failure(throwable);
         }
     }
 
-    private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<? extends RcpMessage> safelyHandle(
+    private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<? extends RcpMessage> safelyHandleInboundStream(
             T connection,
             UUID connectionId,
             TReq request
     ) {
         try {
-            return invokeServerStreamInterceptors(connection, connectionId, request, 0);
+            return invokeInboundStreamInterceptors(connection, connectionId, request, 0);
         } catch (Throwable throwable) {
             return Multi.createFrom().failure(throwable);
         }
@@ -327,75 +338,75 @@ public class RcpRuntime<T extends RcpConnection> {
                 ));
     }
 
-    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> invokeClientUnaryInterceptors(
+    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> invokeOutboundUnaryInterceptors(
             T connection,
             UUID connectionId,
             TReq request,
             int interceptorIndex
     ) {
-        if (interceptorIndex == clientInterceptors.size()) {
+        if (interceptorIndex == outboundInterceptors.size()) {
             return sendUnaryInternal(connectionId, request);
         }
 
-        return clientInterceptors.get(interceptorIndex).interceptUnary(
+        return outboundInterceptors.get(interceptorIndex).interceptUnary(
                 connection,
                 connectionId,
                 request,
-                nextRequest -> invokeClientUnaryInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
+                nextRequest -> invokeOutboundUnaryInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
         );
     }
 
-    private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> invokeClientStreamInterceptors(
+    private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> invokeOutboundStreamInterceptors(
             T connection,
             UUID connectionId,
             TReq request,
             int interceptorIndex
     ) {
-        if (interceptorIndex == clientInterceptors.size()) {
+        if (interceptorIndex == outboundInterceptors.size()) {
             return sendStream(connectionId, request);
         }
 
-        return clientInterceptors.get(interceptorIndex).interceptStream(
+        return outboundInterceptors.get(interceptorIndex).interceptStream(
                 connection,
                 connectionId,
                 request,
-                nextRequest -> invokeClientStreamInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
+                nextRequest -> invokeOutboundStreamInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
         );
     }
 
-    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> invokeServerUnaryInterceptors(
+    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> invokeInboundUnaryInterceptors(
             T connection,
             UUID connectionId,
             TReq request,
             int interceptorIndex
     ) {
-        if (interceptorIndex == serverInterceptors.size()) {
+        if (interceptorIndex == inboundInterceptors.size()) {
             return handlerRegistry.handle(request);
         }
 
-        return Objects.requireNonNull(serverInterceptors.get(interceptorIndex).interceptUnary(
+        return Objects.requireNonNull(inboundInterceptors.get(interceptorIndex).interceptUnary(
                 connection,
                 connectionId,
                 request,
-                nextRequest -> invokeServerUnaryInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
-        ), "server interceptor returned null");
+                nextRequest -> invokeInboundUnaryInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
+        ), "inbound interceptor returned null");
     }
 
-    private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> invokeServerStreamInterceptors(
+    private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> invokeInboundStreamInterceptors(
             T connection,
             UUID connectionId,
             TReq request,
             int interceptorIndex
     ) {
-        if (interceptorIndex == serverInterceptors.size()) {
+        if (interceptorIndex == inboundInterceptors.size()) {
             return handlerRegistry.handle(request);
         }
 
-        return serverInterceptors.get(interceptorIndex).interceptStream(
+        return inboundInterceptors.get(interceptorIndex).interceptStream(
                 connection,
                 connectionId,
                 request,
-                nextRequest -> invokeServerStreamInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
+                nextRequest -> invokeInboundStreamInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
         );
     }
 
@@ -519,6 +530,56 @@ public class RcpRuntime<T extends RcpConnection> {
     private static void ensureMessageId(RcpMessage message) {
         if (message.getId() == null) {
             message.setId(UUID.randomUUID());
+        }
+    }
+
+    private static Duration requireResponseTimeout(Duration responseTimeout) {
+        var timeout = Objects.requireNonNull(responseTimeout, "responseTimeout");
+        if (timeout.isNegative()) {
+            throw new IllegalArgumentException("responseTimeout must not be negative");
+        }
+        return timeout;
+    }
+
+    public static final class Builder<T extends RcpConnection> {
+        private final Function<T, UUID> connectionIdProvider;
+        private final ArrayList<RcpOutboundInterceptor<T>> outboundInterceptors = new ArrayList<>();
+        private final ArrayList<RcpInboundInterceptor<T>> inboundInterceptors = new ArrayList<>();
+        private Duration responseTimeout = DEFAULT_RESPONSE_TIMEOUT;
+
+        private Builder(Function<T, UUID> connectionIdProvider) {
+            this.connectionIdProvider = Objects.requireNonNull(connectionIdProvider, "connectionIdProvider");
+        }
+
+        public Builder<T> responseTimeout(Duration responseTimeout) {
+            this.responseTimeout = requireResponseTimeout(responseTimeout);
+            return this;
+        }
+
+        public Builder<T> outboundInterceptor(RcpOutboundInterceptor<T> interceptor) {
+            outboundInterceptors.add(Objects.requireNonNull(interceptor, "interceptor"));
+            return this;
+        }
+
+        public Builder<T> outboundInterceptors(Iterable<? extends RcpOutboundInterceptor<T>> interceptors) {
+            Objects.requireNonNull(interceptors, "interceptors");
+            interceptors.forEach(this::outboundInterceptor);
+            return this;
+        }
+
+        public Builder<T> inboundInterceptor(RcpInboundInterceptor<T> interceptor) {
+            inboundInterceptors.add(Objects.requireNonNull(interceptor, "interceptor"));
+            return this;
+        }
+
+        public Builder<T> inboundInterceptors(Iterable<? extends RcpInboundInterceptor<T>> interceptors) {
+            Objects.requireNonNull(interceptors, "interceptors");
+            interceptors.forEach(this::inboundInterceptor);
+            return this;
+        }
+
+        public RcpRuntime<T> build() {
+            return new RcpRuntime<>(this);
         }
     }
 
