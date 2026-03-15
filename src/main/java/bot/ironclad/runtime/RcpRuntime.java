@@ -3,6 +3,8 @@ package bot.ironclad.runtime;
 import bot.ironclad.connection.RcpConnection;
 import bot.ironclad.handler.MessageHandler;
 import bot.ironclad.handler.StreamMessageHandler;
+import bot.ironclad.interceptor.RcpClientInterceptor;
+import bot.ironclad.interceptor.RcpServerInterceptor;
 import bot.ironclad.protocol.RcpErrorResponse;
 import bot.ironclad.protocol.RcpMessage;
 import bot.ironclad.protocol.RcpRequest;
@@ -20,6 +22,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -30,6 +33,8 @@ public class RcpRuntime<T extends RcpConnection> {
     private final RcpMessageHandlerRegistry handlerRegistry = new RcpMessageHandlerRegistry();
     private final ConcurrentHashMap<UUID, PendingResponse<?>> pendingResponses = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, T> connections = new ConcurrentHashMap<>();
+    private final CopyOnWriteArrayList<RcpClientInterceptor<T>> clientInterceptors = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<RcpServerInterceptor<T>> serverInterceptors = new CopyOnWriteArrayList<>();
     private final Function<T, UUID> connectionIdProvider;
     private final Duration responseTimeout;
 
@@ -89,41 +94,36 @@ public class RcpRuntime<T extends RcpConnection> {
         Objects.requireNonNull(request, "request");
         ensureMessageId(request);
 
-        return Uni.createFrom().<TRes>emitter(emitter -> {
-            var connection = connections.get(connectionId);
-            if (connection == null) {
-                emitter.fail(new IllegalStateException("No connection for connectionId " + connectionId));
-                return;
-            }
+        var connection = connections.get(connectionId);
+        if (connection == null) {
+            return Uni.createFrom().failure(new IllegalStateException("No connection for connectionId " + connectionId));
+        }
 
-            var requestId = request.getId();
-            var pendingResponse = new PendingSingleResponse<>(connectionId, request.getResponseType(), emitter);
-
-            if (pendingResponses.putIfAbsent(requestId, pendingResponse) != null) {
-                emitter.fail(new IllegalStateException("A request with id %s is already pending".formatted(requestId)));
-                return;
-            }
-
-            emitter.onTermination(() -> pendingResponses.remove(requestId, pendingResponse));
-
-            try {
-                connection.send(request);
-            } catch (Throwable t) {
-                pendingResponses.remove(requestId, pendingResponse);
-                emitter.fail(t);
-            }
-        }).ifNoItem()
-                .after(responseTimeout)
-                .failWith(() -> new TimeoutException(
-                        "Timed out waiting for %s".formatted(request.getResponseType().getName())
-                ));
+        try {
+            return invokeClientUnaryInterceptors(connection, connectionId, request, 0);
+        } catch (Throwable throwable) {
+            return Uni.createFrom().failure(throwable);
+        }
     }
 
     public <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> send(
             UUID connectionId,
             TReq request
     ) {
-        return sendStream(connectionId, request);
+        Objects.requireNonNull(connectionId, "connectionId");
+        Objects.requireNonNull(request, "request");
+        ensureMessageId(request);
+
+        var connection = connections.get(connectionId);
+        if (connection == null) {
+            return Multi.createFrom().failure(new IllegalStateException("No connection for connectionId " + connectionId));
+        }
+
+        try {
+            return invokeClientStreamInterceptors(connection, connectionId, request, 0);
+        } catch (Throwable throwable) {
+            return Multi.createFrom().failure(throwable);
+        }
     }
 
     public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> send(
@@ -137,7 +137,7 @@ public class RcpRuntime<T extends RcpConnection> {
             T connection,
             TReq request
     ) {
-        return sendStream(resolveConnectionId(connection), request);
+        return send(resolveConnectionId(connection), request);
     }
 
     public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> sendMessageAndGetResponse(
@@ -175,7 +175,7 @@ public class RcpRuntime<T extends RcpConnection> {
             UUID connectionId,
             TReq request
     ) {
-        return sendStream(connectionId, request);
+        return send(connectionId, request);
     }
 
     public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> sendMessageAndGetResponseWithRetry(
@@ -200,6 +200,14 @@ public class RcpRuntime<T extends RcpConnection> {
         handlerRegistry.registerStreamHandler(requestType, handler);
     }
 
+    public void addClientInterceptor(RcpClientInterceptor<T> interceptor) {
+        clientInterceptors.add(Objects.requireNonNull(interceptor, "interceptor"));
+    }
+
+    public void addServerInterceptor(RcpServerInterceptor<T> interceptor) {
+        serverInterceptors.add(Objects.requireNonNull(interceptor, "interceptor"));
+    }
+
     private UUID resolveConnectionId(T connection) {
         Objects.requireNonNull(connection, "connection");
         var connectionId = connectionIdProvider.apply(connection);
@@ -221,7 +229,7 @@ public class RcpRuntime<T extends RcpConnection> {
             throw new IllegalStateException("No connection for senderId " + senderId);
         }
 
-        var response = safelyHandle(request);
+        var response = safelyHandle(connection, senderId, request);
         ensureMessageId(response);
         response.setCorrelationId(request.getId());
         connection.send(response);
@@ -239,24 +247,32 @@ public class RcpRuntime<T extends RcpConnection> {
             throw new IllegalStateException("No connection for senderId " + senderId);
         }
 
-        safelyHandle(request).subscribe().with(
+        safelyHandle(connection, senderId, request).subscribe().with(
                 item -> sendCorrelatedMessage(connection, request.getId(), item),
                 failure -> sendCorrelatedMessage(connection, request.getId(), RcpErrorResponse.from(failure)),
                 () -> sendCorrelatedMessage(connection, request.getId(), new RcpStreamCompleted())
         );
     }
 
-    private RcpMessage safelyHandle(RcpRequest<?> request) {
+    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> RcpMessage safelyHandle(
+            T connection,
+            UUID connectionId,
+            TReq request
+    ) {
         try {
-            return handlerRegistry.handle(request);
+            return invokeServerUnaryInterceptors(connection, connectionId, request, 0);
         } catch (Throwable throwable) {
             return RcpErrorResponse.from(throwable);
         }
     }
 
-    private Multi<? extends RcpMessage> safelyHandle(RcpStreamRequest<?> request) {
+    private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<? extends RcpMessage> safelyHandle(
+            T connection,
+            UUID connectionId,
+            TReq request
+    ) {
         try {
-            return handlerRegistry.handle(request);
+            return invokeServerStreamInterceptors(connection, connectionId, request, 0);
         } catch (Throwable throwable) {
             return Multi.createFrom().failure(throwable);
         }
@@ -308,6 +324,108 @@ public class RcpRuntime<T extends RcpConnection> {
                 .after(responseTimeout)
                 .failWith(() -> new TimeoutException(
                         "Timed out waiting for stream item %s".formatted(request.getResponseType().getName())
+                ));
+    }
+
+    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> invokeClientUnaryInterceptors(
+            T connection,
+            UUID connectionId,
+            TReq request,
+            int interceptorIndex
+    ) {
+        if (interceptorIndex == clientInterceptors.size()) {
+            return sendUnaryInternal(connectionId, request);
+        }
+
+        return clientInterceptors.get(interceptorIndex).interceptUnary(
+                connection,
+                connectionId,
+                request,
+                nextRequest -> invokeClientUnaryInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
+        );
+    }
+
+    private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> invokeClientStreamInterceptors(
+            T connection,
+            UUID connectionId,
+            TReq request,
+            int interceptorIndex
+    ) {
+        if (interceptorIndex == clientInterceptors.size()) {
+            return sendStream(connectionId, request);
+        }
+
+        return clientInterceptors.get(interceptorIndex).interceptStream(
+                connection,
+                connectionId,
+                request,
+                nextRequest -> invokeClientStreamInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
+        );
+    }
+
+    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> TRes invokeServerUnaryInterceptors(
+            T connection,
+            UUID connectionId,
+            TReq request,
+            int interceptorIndex
+    ) {
+        if (interceptorIndex == serverInterceptors.size()) {
+            return handlerRegistry.handle(request);
+        }
+
+        return serverInterceptors.get(interceptorIndex).interceptUnary(
+                connection,
+                connectionId,
+                request,
+                nextRequest -> invokeServerUnaryInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
+        );
+    }
+
+    private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> invokeServerStreamInterceptors(
+            T connection,
+            UUID connectionId,
+            TReq request,
+            int interceptorIndex
+    ) {
+        if (interceptorIndex == serverInterceptors.size()) {
+            return handlerRegistry.handle(request);
+        }
+
+        return serverInterceptors.get(interceptorIndex).interceptStream(
+                connection,
+                connectionId,
+                request,
+                nextRequest -> invokeServerStreamInterceptors(connection, connectionId, nextRequest, interceptorIndex + 1)
+        );
+    }
+
+    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> Uni<TRes> sendUnaryInternal(
+            UUID connectionId,
+            TReq request
+    ) {
+        ensureMessageId(request);
+
+        return Uni.createFrom().<TRes>emitter(emitter -> {
+            var requestId = request.getId();
+            var pendingResponse = new PendingSingleResponse<>(connectionId, request.getResponseType(), emitter);
+
+            if (pendingResponses.putIfAbsent(requestId, pendingResponse) != null) {
+                emitter.fail(new IllegalStateException("A request with id %s is already pending".formatted(requestId)));
+                return;
+            }
+
+            emitter.onTermination(() -> pendingResponses.remove(requestId, pendingResponse));
+
+            try {
+                connections.get(connectionId).send(request);
+            } catch (Throwable t) {
+                pendingResponses.remove(requestId, pendingResponse);
+                emitter.fail(t);
+            }
+        }).ifNoItem()
+                .after(responseTimeout)
+                .failWith(() -> new TimeoutException(
+                        "Timed out waiting for %s".formatted(request.getResponseType().getName())
                 ));
     }
 

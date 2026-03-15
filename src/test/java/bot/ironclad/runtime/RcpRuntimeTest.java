@@ -1,6 +1,8 @@
 package bot.ironclad.runtime;
 
 import bot.ironclad.connection.RcpConnection;
+import bot.ironclad.interceptor.RcpClientInterceptor;
+import bot.ironclad.interceptor.RcpServerInterceptor;
 import bot.ironclad.protocol.RcpErrorResponse;
 import bot.ironclad.protocol.RcpMessage;
 import bot.ironclad.protocol.RcpRequest;
@@ -18,6 +20,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -101,6 +104,34 @@ class RcpRuntimeTest {
     }
 
     @Test
+    void clientInterceptorsWrapUnaryCallsInRegistrationOrder() {
+        var events = new ArrayList<String>();
+        runtime.addClientInterceptor(new RecordingClientInterceptor(events, "first"));
+        runtime.addClientInterceptor(new RecordingClientInterceptor(events, "second"));
+
+        var responseStage = runtime.send(connection, new PingRequest("ping")).subscribe().asCompletionStage();
+        var outboundRequest = connection.singleMessage(PingRequest.class);
+
+        var response = new PongResponse("pong");
+        response.setId(UUID.randomUUID());
+        response.setCorrelationId(outboundRequest.getId());
+        runtime.onMessage(connection.id(), response);
+
+        var finalResponse = responseStage.toCompletableFuture().join();
+        assertEquals("pong|second|first", finalResponse.payload());
+        assertEquals("ping|first|second", outboundRequest.payload());
+        assertEquals(
+                List.of(
+                        "first:before:ping",
+                        "second:before:ping|first",
+                        "second:after:pong",
+                        "first:after:pong|second"
+                ),
+                events
+        );
+    }
+
+    @Test
     void resolvesOutboundStreamResponsesUsingTheRequestResponseContract() {
         var probe = StreamProbe.capture(runtime.send(connection, new ChunkRequest("chunk")));
         var outboundRequest = connection.singleMessage(ChunkRequest.class);
@@ -122,6 +153,41 @@ class RcpRuntimeTest {
 
         probe.awaitCompletion();
         assertEquals(List.of("chunk:1", "chunk:2"), probe.payloads(ChunkResponse::payload));
+    }
+
+    @Test
+    void clientInterceptorsWrapStreamCalls() {
+        runtime.addClientInterceptor(new RcpClientInterceptor<>() {
+            @Override
+            @SuppressWarnings("unchecked")
+            public <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> interceptStream(
+                    TestConnection interceptedConnection,
+                    UUID connectionId,
+                    TReq request,
+                    Function<TReq, Multi<TRes>> next
+            ) {
+                return next.apply((TReq) new ChunkRequest("client:" + ((ChunkRequest) request).prefix()))
+                        .onItem()
+                        .transform(item -> (TRes) new ChunkResponse(((ChunkResponse) item).payload() + ":client"));
+            }
+        });
+
+        var probe = StreamProbe.capture(runtime.send(connection, new ChunkRequest("chunk")));
+        var outboundRequest = connection.singleMessage(ChunkRequest.class);
+
+        var first = new ChunkResponse("one");
+        first.setId(UUID.randomUUID());
+        first.setCorrelationId(outboundRequest.getId());
+        runtime.onMessage(connection.id(), first);
+
+        var completed = new RcpStreamCompleted();
+        completed.setId(UUID.randomUUID());
+        completed.setCorrelationId(outboundRequest.getId());
+        runtime.onMessage(connection.id(), completed);
+
+        probe.awaitCompletion();
+        assertEquals("client:chunk", outboundRequest.prefix());
+        assertEquals(List.of("one:client"), probe.payloads(ChunkResponse::payload));
     }
 
     @Test
@@ -270,6 +336,64 @@ class RcpRuntimeTest {
         assertEquals(request.getId(), errorResponse.getCorrelationId());
         assertEquals(IllegalStateException.class.getName(), errorResponse.getErrorType());
         assertEquals("boom", errorResponse.getDetail());
+    }
+
+    @Test
+    void serverInterceptorsWrapUnaryHandlers() {
+        runtime.addServerInterceptor(new RcpServerInterceptor<>() {
+            @Override
+            @SuppressWarnings("unchecked")
+            public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> TRes interceptUnary(
+                    TestConnection interceptedConnection,
+                    UUID connectionId,
+                    TReq request,
+                    Function<TReq, TRes> next
+            ) {
+                var response = next.apply((TReq) new PingRequest("server:" + ((PingRequest) request).payload()));
+                return (TRes) new PongResponse(((PongResponse) response).payload() + ":server");
+            }
+        });
+        runtime.registerHandler(PingRequest.class, request -> new PongResponse(request.payload()));
+
+        var request = new PingRequest("ping");
+        request.setId(UUID.randomUUID());
+
+        runtime.onMessage(connection.id(), request);
+
+        var response = connection.singleMessage(PongResponse.class);
+        assertEquals("server:ping:server", response.payload());
+    }
+
+    @Test
+    void serverInterceptorsWrapStreamHandlers() {
+        runtime.addServerInterceptor(new RcpServerInterceptor<>() {
+            @Override
+            @SuppressWarnings("unchecked")
+            public <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> interceptStream(
+                    TestConnection interceptedConnection,
+                    UUID connectionId,
+                    TReq request,
+                    Function<TReq, Multi<TRes>> next
+            ) {
+                return next.apply((TReq) new ChunkRequest("server:" + ((ChunkRequest) request).prefix()))
+                        .onItem()
+                        .transform(item -> (TRes) new ChunkResponse(((ChunkResponse) item).payload() + ":server"));
+            }
+        });
+        runtime.registerStreamHandler(
+                ChunkRequest.class,
+                request -> Multi.createFrom().items(new ChunkResponse(request.prefix()))
+        );
+
+        var request = new ChunkRequest("chunk");
+        request.setId(UUID.randomUUID());
+
+        runtime.onMessage(connection.id(), request);
+
+        var item = connection.message(0, ChunkResponse.class);
+        assertEquals("server:chunk:server", item.payload());
+        var completed = connection.message(1, RcpStreamCompleted.class);
+        assertEquals(request.getId(), completed.getCorrelationId());
     }
 
     @Test
@@ -457,6 +581,33 @@ class RcpRuntimeTest {
 
         private <R> List<R> payloads(java.util.function.Function<T, R> mapper) {
             return items.stream().map(mapper).toList();
+        }
+    }
+
+    private static final class RecordingClientInterceptor implements RcpClientInterceptor<TestConnection> {
+        private final List<String> events;
+        private final String name;
+
+        private RecordingClientInterceptor(List<String> events, String name) {
+            this.events = events;
+            this.name = name;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> io.smallrye.mutiny.Uni<TRes> interceptUnary(
+                TestConnection interceptedConnection,
+                UUID connectionId,
+                TReq request,
+                Function<TReq, io.smallrye.mutiny.Uni<TRes>> next
+        ) {
+            events.add(name + ":before:" + ((PingRequest) request).payload());
+            return next.apply((TReq) new PingRequest(((PingRequest) request).payload() + "|" + name))
+                    .onItem()
+                    .transform(item -> {
+                        events.add(name + ":after:" + ((PongResponse) item).payload());
+                        return (TRes) new PongResponse(((PongResponse) item).payload() + "|" + name);
+                    });
         }
     }
 }

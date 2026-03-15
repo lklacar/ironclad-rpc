@@ -29,11 +29,11 @@ public class RcpMessageHandlerRegistry {
         );
     }
 
-    public RcpMessage handle(RcpRequest<?> request) {
+    public <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> TRes handle(TReq request) {
         return getHandler(request).handle(request);
     }
 
-    public Multi<? extends RcpMessage> handle(RcpStreamRequest<?> request) {
+    public <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> Multi<TRes> handle(TReq request) {
         return getStreamHandler(request).handle(request);
     }
 
@@ -47,10 +47,10 @@ public class RcpMessageHandlerRegistry {
         );
     }
 
-    private RegisteredHandler<?, ?> getHandler(RcpRequest<?> request) {
-        @SuppressWarnings("unchecked")
-        var messageType = (Class<? extends RcpRequest<?>>) request.getClass();
-        var handler = handlers.get(messageType);
+    @SuppressWarnings("unchecked")
+    private <TReq extends RcpRequest<TRes>, TRes extends RcpMessage> RegisteredHandler<TReq, TRes> getHandler(TReq request) {
+        var messageType = (Class<TReq>) request.getClass();
+        var handler = (RegisteredHandler<TReq, TRes>) handlers.get(messageType);
 
         if (handler == null) {
             throw new IllegalArgumentException("No handler registered for " + messageType.getName());
@@ -59,10 +59,10 @@ public class RcpMessageHandlerRegistry {
         return handler;
     }
 
-    private RegisteredStreamHandler<?, ?> getStreamHandler(RcpStreamRequest<?> request) {
-        @SuppressWarnings("unchecked")
-        var messageType = (Class<? extends RcpStreamRequest<?>>) request.getClass();
-        var handler = streamHandlers.get(messageType);
+    @SuppressWarnings("unchecked")
+    private <TReq extends RcpStreamRequest<TRes>, TRes extends RcpMessage> RegisteredStreamHandler<TReq, TRes> getStreamHandler(TReq request) {
+        var messageType = (Class<TReq>) request.getClass();
+        var handler = (RegisteredStreamHandler<TReq, TRes>) streamHandlers.get(messageType);
 
         if (handler == null) {
             throw new IllegalArgumentException("No stream handler registered for " + messageType.getName());
